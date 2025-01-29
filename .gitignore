@@ -1,8 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
-data/
 notebooks/
-*.csv
 .DS_Store
 .vscode/
