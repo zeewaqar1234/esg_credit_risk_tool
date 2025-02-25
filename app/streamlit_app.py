@@ -1,217 +1,147 @@
-# app/streamlit_app.py
-
-import sys
-import os
-import pandas as pd
 import streamlit as st
+import pandas as pd
 from pathlib import Path
+import sys
+import logging
+import subprocess
 import plotly.express as px
 
-# Add project root to Python path
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.append(str(PROJECT_ROOT))
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Import project modules
-from src.model import CreditRiskModel
-from src.scenario import ClimateScenarioEngine
+# Fix path for src imports
+project_root = Path(__file__).parent.parent
+sys.path.append(str(project_root))
+
+from src.model import EBACreditModel
+from src.scenario import EBAStressEngine
+from src.eba_config import SCENARIOS, RISK_LEVELS
+from src.visualization_eba import EBAVisualizer
 
 def main():
-    # Configuration
-    st.set_page_config(
-        page_title="EU Corporate Risk Dashboard",
-        page_icon="📈",
-        layout="wide"
-    )
+    st.set_page_config(page_title="EBA ESG Risk Dashboard", page_icon="🌍", layout="wide")
 
-    # ---- Data Loading ----
+    # Load data with option to regenerate
     @st.cache_data
     def load_data():
+        data_path = project_root / "data" / "final_dataset.csv"
+        logger.info(f"Loading data from: {data_path}")
         try:
-            data_path = PROJECT_ROOT / "data" / "final_dataset.csv"
-            return pd.read_csv(data_path)
+            df = pd.read_csv(data_path)
+            required = ['Ticker', 'Debt/Equity', 'InterestCoverage', 'CarbonImpact', 
+                        'EmissionsTrend', 'SocialScore', 'GovernanceScore', 'TotalAssets']
+            logger.info(f"Loaded columns: {list(df.columns)}")
+            missing = [col for col in required if col not in df.columns]
+            if missing:
+                st.error(f"Data missing: {', '.join(missing)}. Update src/data_pipeline.py and run it.")
+                st.write("Current columns in final_dataset.csv:", list(df.columns))
+                if st.button("Run Data Pipeline Now"):
+                    try:
+                        result = subprocess.run(['python3', 'src/data_pipeline.py'], 
+                                             cwd=str(project_root), capture_output=True, text=True)
+                        st.write("Pipeline Output:", result.stdout)
+                        if result.stderr:
+                            st.error(f"Pipeline Error: {result.stderr}")
+                        else:
+                            st.success("Pipeline ran successfully! Refresh the page.")
+                    except Exception as e:
+                        st.error(f"Failed to run pipeline: {e}")
+                st.stop()
+            return df
         except FileNotFoundError:
-            st.error("Critical Error: Dataset not found!")
+            st.error("No final_dataset.csv found! Run src/data_pipeline.py first.")
             st.stop()
 
-    df = load_data()
+    base_df = load_data()
 
-    # Initialize models
-    risk_model = CreditRiskModel()
-    scenario_engine = ClimateScenarioEngine()
+    # Model and scenarios
+    model = EBACreditModel()
+    engine = EBAStressEngine()
 
-    # ---- Sidebar Controls ----
+    # Sidebar
     with st.sidebar:
-        st.header("Scenario Parameters")
-        scenario = st.selectbox(
-            "Climate Transition Scenario",
-            list(scenario_engine.SCENARIO_MULTIPLIERS.keys()),
-            index=0
-        )
-        # Removed the old carbon tax slider
-        # Added a new 'carbon_sensitivity' slider
-        carbon_sensitivity = st.slider(
-            "Carbon Sensitivity (%)",
-            50,    # minimum
-            300,   # maximum
-            100,   # default
-            step=10,
-            help="Multiply existing carbon intensity by this percentage"
-        )
-        st.divider()
-        st.markdown("**Developed by:** Syed Zee Waqar Hussain")
-        st.markdown("**Data Source:** ECB Climate Risk Database")
+        st.header("Stress Test Options")
+        scenario = st.selectbox("Choose Scenario", list(SCENARIOS.keys()), index=0)
+        st.markdown(f"**High Risk:** {RISK_LEVELS['high_risk']} | **High Emitter:** {RISK_LEVELS['high_emitter']} tCO₂/€M")
+        st.info("EBA 2025: Tests transition (carbon costs) and physical (climate events) risks.")
 
-    # ---- Apply Scenario & Recompute PDs ----
-    # 1) Make a copy so we don't overwrite the original DataFrame
-    scenario_df = df.copy()
+    # Process data
+    normal_df = engine.apply_scenario(base_df, 'Normal')
+    normal_risk = model.calculate_risk(normal_df)
+    scenario_df = engine.apply_scenario(base_df, scenario)
+    risk_df = model.calculate_risk(scenario_df)
+    risk_df['StressCapital'] = model.estimate_capital(risk_df)
+    risk_df['RiskChange'] = risk_df['RiskScore'] - normal_risk['RiskScore']
 
-    # 2) Apply the chosen scenario (adjust CarbonIntensity by scenario multiplier + user slider)
-    scenario_df = scenario_engine.apply_scenario(
-    scenario_df,
-    scenario_name=scenario,
-    carbon_sensitivity=carbon_sensitivity
-)
+    # Dashboard
+    st.title("EBA 2025 ESG Risk Dashboard")
+    st.markdown("See how ESG risks affect DAX firms—aligned with EBA 2025 guidelines.")
 
+    # Metrics with better layout
+    st.subheader("Key Insights")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        risky = int(risk_df['RiskLevel'].eq('High Risk').sum())  # Convert to Python int
+        delta_risky = int(risky - normal_risk['RiskLevel'].eq('High Risk').sum())  # Convert to Python int
+        st.metric("High Risk Firms", risky, delta=delta_risky, delta_color="inverse")
+    with col2:
+        carbon = float(risk_df['CarbonImpact'].mean())  # Convert to Python float
+        delta_carbon = float(carbon - normal_df['CarbonImpact'].mean())  # Convert to Python float
+        st.metric("Avg Carbon Impact", f"{carbon:.1f} tCO₂/€M", delta=f"{delta_carbon:.1f}")
+    with col3:
+        capital = float(risk_df['StressCapital'].sum() / 1e6)  # Convert to Python float
+        st.metric("Stress Capital", f"€{capital:,.0f}M", help="Extra funds for ESG losses (EBA stress test)")
+    with col4:
+        avg_risk = float(risk_df['RiskScore'].mean())  # Convert to Python float
+        delta_risk = float(risk_df['RiskChange'].mean())  # Convert to Python float
+        st.metric("Avg Risk Score", f"{avg_risk:.2f}", delta=f"{delta_risk:+.2f}")
 
-    # 3) Predict PD after scenario adjustments
-    scenario_df["PD Baseline"] = risk_model.predict_pd(scenario_df, include_esg=False)
-    scenario_df["PD ESG Adjusted"] = risk_model.predict_pd(scenario_df, include_esg=True)
-
-    # 4) Calculate capital with scenario-updated PD
-    scenario_df["Capital Requirement"] = risk_model.calculate_capital(scenario_df)
-
-    # ---- Main Interface ----
-    st.title("EU Corporate Credit Risk Analysis Dashboard")
-
-    # Key Metrics
-    cols = st.columns(4)
-    metrics = {
-        "Avg Baseline PD": scenario_df["PD Baseline"].mean(),
-        "Avg ESG Adj PD": scenario_df["PD ESG Adjusted"].mean(),
-        "High Risk Firms": (scenario_df["PD ESG Adjusted"] > 0.25).sum(),
-        "Total Capital Impact": scenario_df["Capital Requirement"].sum()
-    }
-
-    with cols[0]:
-        st.metric(
-            "Baseline Risk",
-            f"{metrics['Avg Baseline PD']:.2%}",
-            help="Average default probability without ESG factors"
-        )
-    with cols[1]:
-        delta = metrics["Avg ESG Adj PD"] - metrics["Avg Baseline PD"]
-        st.metric(
-            "ESG Adjusted Risk",
-            f"{metrics['Avg ESG Adj PD']:.2%}",
-            f"{delta:+.2%}",
-            delta_color="inverse"
-        )
-    with cols[2]:
-        st.metric(
-            "High Risk Firms",
-            metrics["High Risk Firms"],
-            help="Firms with PD > 25%"
-        )
-    with cols[3]:
-        st.metric(
-            "Capital Impact",
-            f"€{metrics['Total Capital Impact']/1e6:.1f}M",
-            help="Total Basel III capital requirements"
-        )
-
-    # ---- Visualizations ----
-    tab1, tab2, tab3 = st.tabs(["Risk Distribution", "ESG Impact", "Sector Analysis"])
+    # Tabs
+    tab1, tab2, tab3 = st.tabs(["Risk Overview", "Industry Insights", "Firm Details"])
 
     with tab1:
-        fig = px.histogram(
-            scenario_df,
-            x="PD ESG Adjusted",
-            nbins=20,
-            color="Industry",
-            title="Probability of Default Distribution",
-            labels={"PD ESG Adjusted": "Default Probability"},
-            hover_data=["Ticker"]
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        st.subheader("Risk and ESG Breakdown")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(EBAVisualizer.risk_score_distribution(risk_df), use_container_width=True)
+        with col2:
+            st.plotly_chart(EBAVisualizer.carbon_risk_scatter(risk_df), use_container_width=True)
+        st.plotly_chart(EBAVisualizer.risk_drivers(risk_df), use_container_width=True)
 
     with tab2:
-        col1, col2 = st.columns(2)
-        with col1:
-            fig = px.scatter(
-                scenario_df,
-                x="ESG_Score",
-                y="PD ESG Adjusted",
-                color="Industry",
-                size="CarbonIntensity",
-                title="ESG Score vs Default Risk",
-                hover_name="Ticker"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        with col2:
-            fig = px.bar(
-                scenario_df.sort_values("PD ESG Adjusted", ascending=False)[:10],
-                x="Ticker",
-                y=["PD Baseline", "PD ESG Adjusted"],
-                title="Top 10 Riskiest Firms",
-                barmode="group"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        st.subheader("How Industries Compare")
+        industry_avg = risk_df.groupby('Industry').agg({
+            'RiskScore': 'mean', 'CarbonImpact': 'mean', 'StressCapital': 'sum'
+        }).reset_index()
+        industry_avg['StressCapital'] = industry_avg['StressCapital'] / 1e6  # Convert to €M
+        st.plotly_chart(
+            px.bar(industry_avg, x='Industry', y='RiskScore', title="Average Risk by Industry",
+                   color='RiskScore', color_continuous_scale='RdYlGn_r', text_auto='.2f'),
+            use_container_width=True
+        )
+        st.dataframe(industry_avg.rename(columns={'StressCapital': 'Total Stress Capital (€M)'}))
 
     with tab3:
-        sector_analysis = scenario_df.groupby("Industry").agg({
-            "PD ESG Adjusted": "mean",
-            "Capital Requirement": "sum"
-        }).reset_index()
-
-        col1, col2 = st.columns(2)
-        with col1:
-            fig = px.pie(
-                sector_analysis,
-                names="Industry",
-                values="Capital Requirement",
-                title="Capital Allocation by Sector"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        with col2:
-            fig = px.bar(
-                sector_analysis.sort_values("PD ESG Adjusted", ascending=False),
-                x="Industry",
-                y="PD ESG Adjusted",
-                title="Sector Risk Profile"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    # ---- Data Table ----
-    st.subheader("Portfolio Details")
-    st.dataframe(
-        scenario_df.sort_values("PD ESG Adjusted", ascending=False),
-        column_config={
-            "Ticker": "Company",
-            "PD Baseline": st.column_config.NumberColumn(
-                "Baseline PD",
-                format="%.2f%%",
-                help="Default probability without ESG factors"
-            ),
-            "PD ESG Adjusted": st.column_config.NumberColumn(
-                "ESG Adjusted PD",
-                format="%.2f%%"
-            ),
-            "ESG_Score": st.column_config.ProgressColumn(
-                "ESG Score",
-                format="%d",
-                min_value=0,
-                max_value=100
-            ),
-            "Capital Requirement": st.column_config.NumberColumn(
-                "Capital (€M)",
-                format="€%.1fM"
-            )
-        },
-        hide_index=True,
-        use_container_width=True
-    )
+        st.subheader("Firm-by-Firm View")
+        display_df = risk_df[[
+            'Ticker', 'Industry', 'RiskScore', 'RiskLevel', 'RiskChange',
+            'CarbonImpact', 'EmissionsTrend', 'SocialScore', 'GovernanceScore', 'StressCapital'
+        ]].sort_values('RiskScore', ascending=False)
+        st.dataframe(
+            display_df,
+            column_config={
+                'RiskScore': st.column_config.NumberColumn("Risk Score", format="%.2f"),
+                'RiskChange': st.column_config.NumberColumn("Change vs Normal", format="%.2f"),
+                'CarbonImpact': st.column_config.NumberColumn("Carbon (tCO₂/€M)", format="%.0f"),
+                'EmissionsTrend': st.column_config.ProgressColumn("Emissions Trend", min_value=-50, max_value=50, format="%d%%"),
+                'SocialScore': st.column_config.ProgressColumn("Social Score", min_value=0, max_value=100, format="%d"),
+                'GovernanceScore': st.column_config.ProgressColumn("Governance", min_value=0, max_value=100, format="%d"),
+                'StressCapital': st.column_config.NumberColumn("Stress Capital (€)", format="€%.0f")
+            },
+            hide_index=True,
+            use_container_width=True
+        )
 
 if __name__ == "__main__":
     main()
